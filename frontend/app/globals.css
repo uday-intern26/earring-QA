@@ -1,0 +1,20 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  min-height: 100vh;
+  background: #09090b;
+  color: #e4e4e7;
+}
+
+input,
+select,
+textarea {
+  background: #18181b;
+  color: #fafafa;
+}

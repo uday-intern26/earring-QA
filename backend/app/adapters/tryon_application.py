@@ -1,0 +1,658 @@
+"""Try-on application boundary. Web uses Playwright. Desktop is reserved."""
+
+from __future__ import annotations
+
+import json
+from abc import ABC, abstractmethod
+from pathlib import Path
+
+from app.adapters.browser_adapter import PlaywrightBrowserAdapter
+from app.adapters.earring_anchor_adapter import EarringAnchorPageAdapter
+from app.adapters.screenshot_adapter import ScreenshotAdapter
+from app.core.logging import log_event
+from app.models.application import Application
+from app.services.frame_selector import RawFrame
+
+USERNAME_SELECTORS = [
+    "input[type='email']",
+    "input[name='username']",
+    "input[name='email']",
+    "input[id='username']",
+    "input[id='email']",
+    "input[autocomplete='username']",
+    "input[type='text']",
+]
+PASSWORD_SELECTORS = [
+    "input[type='password']",
+    "input[name='password']",
+    "input[id='password']",
+]
+SUBMIT_SELECTORS = [
+    "button[type='submit']",
+    "input[type='submit']",
+    "button:has-text('Sign in')",
+    "button:has-text('Log in')",
+    "button:has-text('Login')",
+    "button:has-text('Continue')",
+]
+
+
+class TryOnError(Exception):
+    def __init__(self, message: str, code: str, recommended_action: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.recommended_action = recommended_action
+
+
+class TryOnApplicationAdapter(ABC):
+    @abstractmethod
+    async def connect(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def authenticate(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def launch(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def select_jewelry(self, jewelry_id: str | None) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def capture(self) -> list[RawFrame]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_earring_anchor(self) -> dict | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def close(self) -> None:
+        raise NotImplementedError
+
+
+class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
+    def __init__(
+        self,
+        application: Application,
+        *,
+        username: str,
+        password: str,
+        output_dir: Path,
+        fps: int,
+        duration_seconds: float,
+        headless: bool,
+        viewport_width: int,
+        viewport_height: int,
+        timeout_ms: int,
+    ) -> None:
+        self.application = application
+        self.username = username
+        self.password = password
+        self.output_dir = output_dir
+        self.fps = fps
+        self.duration_seconds = duration_seconds
+        camera_video = Path(application.video_path) if application.video_path else None
+        self.browser = PlaywrightBrowserAdapter(
+            headless=headless,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
+            timeout_ms=timeout_ms,
+            video_dir=output_dir / "video",
+            camera_video=camera_video,
+        )
+        self.screenshots = ScreenshotAdapter(self.browser)
+        self.anchors = EarringAnchorPageAdapter(self.browser)
+        self.video_file: Path | None = None
+
+    async def connect(self) -> None:
+        if not self.application.url:
+            raise TryOnError("Web application URL is missing.", "INVALID_URL")
+        if self.application.video_path and not Path(self.application.video_path).is_file():
+            raise TryOnError(
+                "The bare-ear face video was not found. Upload that video before running the try-on test.",
+                "VIDEO_MISSING",
+            )
+        await self.browser.start()
+        try:
+            await self.browser.goto(self.application.url)
+        except Exception as exc:
+            raise TryOnError(
+                f"Unable to open the application URL: {exc.__class__.__name__}.",
+                "APPLICATION_UNREACHABLE",
+                "Check the public Amplify URL and that the machine can reach it.",
+            ) from exc
+        log_event("APPLICATION_CONNECTED", url=self.application.url)
+
+    async def authenticate(self) -> None:
+        password_selector = await self._wait_present(
+            _split(self.application.password_selector) or PASSWORD_SELECTORS,
+            timeout_ms=12000,
+        )
+        if password_selector is None:
+            log_event("AUTHENTICATION_SUCCESS", detail="No password field was present.")
+            return
+        if not self.username or not self.password:
+            raise TryOnError(
+                "Authentication failed. The page has a login form and no credentials were provided.",
+                "AUTH_FAILED",
+                "Enter the tester username and password, then validate again.",
+            )
+        username_selector = await self._wait_present(
+            _split(self.application.username_selector) or USERNAME_SELECTORS,
+            timeout_ms=3000,
+        )
+        if username_selector is None:
+            raise TryOnError(
+                "Authentication failed. A password field was found, but the username field was not.",
+                "AUTH_FAILED",
+                "Set a username selector in the application configuration.",
+            )
+        await self.browser.fill(username_selector, self.username)
+        await self.browser.fill(password_selector, self.password)
+        submit_selector = await self._wait_present(
+            _split(self.application.submit_selector) or SUBMIT_SELECTORS,
+            timeout_ms=3000,
+        )
+        if submit_selector is None:
+            raise TryOnError(
+                "Authentication failed. The login submit control was not found.",
+                "AUTH_FAILED",
+                "Set a submit selector in the application configuration.",
+            )
+        await self.browser.click(submit_selector)
+        for _ in range(20):
+            await self.browser.wait_for_timeout(500)
+            try:
+                still_login = await self.browser.query("input[type='password']")
+            except Exception:
+                still_login = None
+            if still_login is None:
+                log_event("AUTHENTICATION_SUCCESS")
+                return
+        raise TryOnError(
+            "Authentication failed.",
+            "AUTH_FAILED",
+            "Check the username, password, and login selectors. The password was not logged.",
+        )
+
+    async def _wait_present(self, selectors: list[str], timeout_ms: int) -> str | None:
+        elapsed = 0
+        while elapsed <= timeout_ms:
+            found = await self._first_present(selectors)
+            if found is not None:
+                return found
+            await self.browser.wait_for_timeout(250)
+            elapsed += 250
+        return None
+
+    async def launch(self) -> None:
+        await self._reach_tryon()
+        await self._dismiss_overlays()
+        await self._click_exact("Video")
+        await self._leave_photo_matching()
+        ready = await self._wait_for_canvas(timeout_ms=90000)
+        if not ready:
+            raise TryOnError(
+                "Try-on application did not reach the ready state.",
+                "APPLICATION_NOT_READY",
+                "Confirm login reaches the try-on view and the face canvas is visible.",
+            )
+        await self._leave_photo_matching()
+        log_event("TRYON_READY")
+
+    async def _reach_tryon(self) -> None:
+        target = self.application.url
+        for _ in range(10):
+            href = str(await self.browser.evaluate("() => location.href") or "")
+            if "/choose-theme" in href:
+                await self._click_visible_text("Soft Gray")
+                await self._click_visible_text("Next")
+                await self.browser.wait_for_timeout(1500)
+                continue
+            if "/try-on" in href:
+                return
+            if target:
+                await self.browser.goto(target)
+            await self.browser.wait_for_timeout(1500)
+
+    async def _wait_for_tryon_view(self) -> None:
+        for _ in range(60):
+            ready = await self.browser.evaluate(
+                """() => {
+                  const text = document.body.innerText || '';
+                  if (text.includes('Loading try-on')) return false;
+                  return [...document.querySelectorAll('iframe')].some((frame) => {
+                    const src = frame.getAttribute('src') || '';
+                    if (src.includes('advertisement')) return false;
+                    const box = frame.getBoundingClientRect();
+                    return box.width > 80 && box.height > 80;
+                  });
+                }"""
+            )
+            if ready:
+                await self.browser.wait_for_timeout(1000)
+                return
+            await self.browser.wait_for_timeout(500)
+        raise TryOnError(
+            "The try-on viewport did not open, so the advertisement video was not used.",
+            "APPLICATION_NOT_READY",
+            "Stay on Video mode until the try-on face is visible, then run the test again.",
+        )
+
+    async def _wait_for_canvas(self, timeout_ms: int) -> bool:
+        elapsed = 0
+        while elapsed <= timeout_ms:
+            await self._leave_photo_matching()
+            ready = await self.browser.evaluate(
+                """() => {
+                  const text = document.body.innerText || '';
+                  if (text.includes('Loading try-on')) return false;
+                  return [...document.querySelectorAll('iframe')].some((frame) => {
+                    const src = frame.getAttribute('src') || '';
+                    if (src.includes('advertisement')) return false;
+                    const box = frame.getBoundingClientRect();
+                    return box.width > 80 && box.height > 80;
+                  });
+                }"""
+            )
+            if ready:
+                return True
+            await self.browser.wait_for_timeout(500)
+            elapsed += 500
+        return False
+
+    async def _dismiss_overlays(self) -> None:
+        saw_dialog = False
+        for _ in range(20):
+            text = str(await self.browser.evaluate("() => document.body.innerText") or "")
+            if "Stay Updated" in text or "Maybe later" in text:
+                saw_dialog = True
+                click_text = getattr(self.browser, "click_text", None)
+                if click_text is not None:
+                    try:
+                        await click_text("Maybe later")
+                    except Exception:
+                        pass
+                await self.browser.evaluate(
+                    """() => {
+                      const nodes = [...document.querySelectorAll('button, [role="button"], a, span, p')];
+                      const later = nodes.find((node) => (node.innerText || '').trim() === 'Maybe later');
+                      if (later) { later.click(); return; }
+                      const close = nodes.find((node) => (node.getAttribute('aria-label') || '').toLowerCase() === 'close');
+                      if (close) close.click();
+                    }"""
+                )
+                await self.browser.wait_for_timeout(400)
+                continue
+            if saw_dialog:
+                return
+            await self.browser.wait_for_timeout(500)
+
+    async def _leave_photo_matching(self) -> None:
+        text = str(await self.browser.evaluate("() => document.body.innerText") or "")
+        if "No matching jewelry" in text or "Try All Categories" in text:
+            await self._click_exact("Show All Category")
+
+    async def _open_earring_catalog(self) -> None:
+        """Open the catalog. AI Recommendations matches the face photo and is not the test."""
+        for _ in range(40):
+            await self._click_exact("Show All Category")
+            await self.browser.wait_for_timeout(300)
+            await self._click_exact("Earrings")
+            state = await self.browser.evaluate(
+                """() => {
+                  const text = document.body.innerText || '';
+                  const photoMatch = text.includes('No matching jewelry') || text.includes('Try All Categories');
+                  const earrings = [...document.querySelectorAll('img')]
+                    .map((img) => (img.alt || '').trim())
+                    .filter((alt) => /earring/i.test(alt));
+                  return { photoMatch, count: earrings.length };
+                }"""
+            )
+            if state and not state.get("photoMatch") and state.get("count", 0) > 0:
+                return
+            await self.browser.wait_for_timeout(500)
+        raise TryOnError(
+            "The try-on page stayed on photo matching. Catalog earrings were not opened.",
+            "JEWELRY_NOT_FOUND",
+            "Use Show All Category, then Earrings. Do not use AI Recommendations.",
+        )
+
+    async def _click_exact(self, label: str) -> bool:
+        clicked = await self.browser.evaluate(
+            """(label) => {
+              const wanted = label.trim().toLowerCase();
+              const nodes = [...document.querySelectorAll('button, [role="button"], a, div, span, p')];
+              const matches = nodes.filter((node) => {
+                const text = (node.innerText || node.getAttribute('aria-label') || '').trim().toLowerCase();
+                return text === wanted;
+              });
+              if (!matches.length) return false;
+              matches.sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
+              matches[0].click();
+              return true;
+            }""",
+            label,
+        )
+        return bool(clicked)
+
+    async def _click_visible_text(self, label: str) -> bool:
+        clicked = await self.browser.evaluate(
+            """(label) => {
+              const nodes = [...document.querySelectorAll('button, [role="button"], a')];
+              const match = nodes.find((node) => (node.innerText || node.getAttribute('aria-label') || '').trim() === label)
+                || nodes.find((node) => (node.innerText || '').includes(label));
+              if (!match) return false;
+              match.click();
+              return true;
+            }""",
+            label,
+        )
+        return bool(clicked)
+
+    async def select_jewelry(self, jewelry_id: str | None) -> str:
+        await self._click_exact("Video")
+        await self._open_earring_catalog()
+        selected = None
+        for _ in range(20):
+            selected = await self.browser.evaluate(
+                """(jewelryId) => {
+                  const text = document.body.innerText || '';
+                  if (text.includes('No matching jewelry') || text.includes('Try All Categories')) return null;
+                  const wanted = (jewelryId || '').trim().toLowerCase();
+                  const images = [...document.querySelectorAll('img')].filter((img) => /earring/i.test(img.alt || ''));
+                  const match = wanted
+                    ? images.find((img) => (img.alt || '').toLowerCase().includes(wanted))
+                    : images.find((img) => /stud earring/i.test(img.alt || ''));
+                  if (!match) return null;
+                  (match.closest('button, a, [role="button"]') || match).click();
+                  return match.alt || 'earring';
+                }""",
+                jewelry_id or "",
+            )
+            if selected:
+                break
+            await self._click_exact("Show All Category")
+            await self._click_exact("Earrings")
+            await self.browser.wait_for_timeout(500)
+        if not selected:
+            raise TryOnError(
+                "The catalog earring was not selected. Photo matching was not used.",
+                "JEWELRY_NOT_FOUND",
+                "Open Show All Category, choose Earrings, and select the catalog earring.",
+            )
+        await self.browser.wait_for_timeout(4000)
+        still_matching = await self.browser.evaluate(
+            """() => {
+              const text = document.body.innerText || '';
+              return text.includes('No matching jewelry') || text.includes('Try All Categories');
+            }"""
+        )
+        if still_matching:
+            raise TryOnError(
+                "The try-on page stayed on photo matching after the catalog earring was selected.",
+                "JEWELRY_NOT_FOUND",
+                "Leave AI Recommendations closed and keep Show All Category selected.",
+            )
+        return f"Selected catalogue earring {selected}."
+
+    async def use_straight_face_image(self, path: Path) -> None:
+        """Show the uploaded face. Catalog earrings are placed on this photo, not matched to it."""
+        await self._click_exact("Image")
+        await self.browser.wait_for_timeout(800)
+        try:
+            await self.browser.set_input_files("[data-testid='image-upload-input']", path)
+        except Exception:
+            await self.browser.set_input_files("input[type='file']", path)
+        await self.browser.wait_for_timeout(2000)
+        await self._leave_photo_matching()
+
+    async def catalog_earring_names(self) -> list[str]:
+        await self._open_earring_catalog()
+        names = await self.browser.evaluate(
+            """() => {
+              const seen = new Set();
+              const names = [];
+              for (const img of document.querySelectorAll('img')) {
+                const alt = (img.alt || '').trim();
+                if (!/earring/i.test(alt) || seen.has(alt)) continue;
+                seen.add(alt);
+                names.push(alt);
+              }
+              return names;
+            }"""
+        )
+        return list(names or [])
+
+    async def face_panel_box(self) -> dict:
+        box = await self.browser.evaluate(
+            """() => {
+              const nodes = [...document.querySelectorAll('h1, h2, h3, div, p, span')];
+              const title = nodes.find((node) => (node.innerText || '').trim() === 'Jewelry Collection');
+              const right = title ? title.getBoundingClientRect().left : window.innerWidth * 0.62;
+              const width = Math.max(80, Math.min(right - 12, window.innerWidth - 12));
+              const height = Math.max(80, window.innerHeight - 88);
+              return { x: 8, y: 72, width, height };
+            }"""
+        )
+        return box or {"x": 8, "y": 72, "width": 700, "height": 600}
+
+    async def capture(self) -> list[RawFrame]:
+        log_event("CAPTURE_STARTED", fps=self.fps, duration_seconds=self.duration_seconds)
+        await self._dismiss_overlays()
+        await self._wait_for_tryon_view()
+        blocked = await self.browser.evaluate(
+            """() => {
+              const text = document.body.innerText || '';
+              if (text.includes('Loading try-on')) return 'loading';
+              if (text.includes('No matching jewelry') || text.includes('Try All Categories')) return 'photo-match';
+              return '';
+            }"""
+        )
+        if blocked == "photo-match":
+            raise TryOnError(
+                "Capture stopped because the page was matching the face photo instead of showing a catalog earring.",
+                "JEWELRY_NOT_FOUND",
+                "Open Show All Category and select the catalog earring before capture.",
+            )
+        if blocked == "loading":
+            raise TryOnError(
+                "The try-on view was still loading, so the catalog earring was not measured.",
+                "APPLICATION_NOT_READY",
+                "Wait until the try-on face is visible, then run the test again.",
+            )
+        frame_dir = self.output_dir / "captured"
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        interval_ms = max(1, int(round(1000 / self.fps)))
+        total = max(1, int(self.duration_seconds * self.fps))
+        frames: list[RawFrame] = []
+        for index in range(total):
+            path = frame_dir / f"frame_{index:04d}.png"
+            await self.screenshots.capture(path)
+            state = await self.get_earring_anchor()
+            frames.append(RawFrame(index=index, timestamp_ms=index * interval_ms, path=path, debug_state=state))
+            if index < total - 1:
+                await self.browser.wait_for_timeout(interval_ms)
+        meta_path = self.output_dir / "capture_meta.json"
+        meta_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "index": frame.index,
+                        "timestamp_ms": frame.timestamp_ms,
+                        "path": str(frame.path),
+                        "debug": frame.debug_state,
+                    }
+                    for frame in frames
+                ],
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        log_event("CAPTURE_COMPLETED", frames=len(frames))
+        return frames
+
+    async def get_earring_anchor(self) -> dict | None:
+        return await self.anchors.read_state()
+
+    async def close(self) -> None:
+        self.video_file = await self.browser.video_path()
+        await self.browser.close()
+
+
+class VideoFileTryOnAdapter(TryOnApplicationAdapter):
+    def __init__(self, application: Application, output_dir: Path, fps: int) -> None:
+        self.application = application
+        self.output_dir = output_dir
+        self.fps = fps
+        self._frames: list[RawFrame] = []
+
+    async def connect(self) -> None:
+        if not self.application.video_path:
+            raise TryOnError("Video/file application is missing a video path.", "VIDEO_MISSING")
+        path = Path(self.application.video_path)
+        if not path.is_file():
+            raise TryOnError(f"Video file was not found: {path.name}", "VIDEO_MISSING")
+
+    async def authenticate(self) -> None:
+        return None
+
+    async def launch(self) -> None:
+        return None
+
+    async def select_jewelry(self, jewelry_id: str | None) -> str:
+        return "Video/file mode does not select jewellery in a live application."
+
+    async def capture(self) -> list[RawFrame]:
+        from app.services.frame_selector import FrameSelector
+
+        selector = FrameSelector(
+            min_blur_variance=0,
+            blur_norm_variance=1,
+            duplicate_hash_distance=0,
+            head_pose_max_delta_deg=180,
+            head_pose_max_yaw_deg=180,
+            min_ear_width=0.001,
+            minimum_confidence=0,
+            ear_side="both",
+        )
+        frames = selector.extract_video(Path(self.application.video_path), self.fps, self.output_dir / "captured")
+        anchors = _load_anchor_sidecar(self.application.anchor_file)
+        if anchors:
+            for frame in frames:
+                frame.debug_state = anchors.get(frame.index) or anchors.get(frame.timestamp_ms)
+        self._frames = frames
+        return frames
+
+    async def get_earring_anchor(self) -> dict | None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
+class DesktopTryOnAdapter(TryOnApplicationAdapter):
+    async def connect(self) -> None:
+        raise TryOnError(
+            "Desktop application automation is not implemented yet.",
+            "DESKTOP_UNSUPPORTED",
+            "Use Web Application or Video/File. The adapter boundary is in place for a later desktop engine.",
+        )
+
+    async def authenticate(self) -> None:
+        await self.connect()
+
+    async def launch(self) -> None:
+        await self.connect()
+
+    async def select_jewelry(self, jewelry_id: str | None) -> str:
+        await self.connect()
+        return ""
+
+    async def capture(self) -> list[RawFrame]:
+        await self.connect()
+        return []
+
+    async def get_earring_anchor(self) -> dict | None:
+        await self.connect()
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
+def build_tryon_adapter(application: Application, **kwargs) -> TryOnApplicationAdapter:
+    if application.type == "web":
+        return PlaywrightTryOnAdapter(application, **kwargs)
+    if application.type == "video":
+        return VideoFileTryOnAdapter(
+            application,
+            output_dir=kwargs["output_dir"],
+            fps=kwargs["fps"],
+        )
+    if application.type == "desktop":
+        return DesktopTryOnAdapter()
+    raise TryOnError(f"Unknown application type '{application.type}'.", "INVALID_APPLICATION")
+
+
+def _split(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split("||") if item.strip()]
+
+
+def _load_anchor_sidecar(path: str | None) -> dict:
+    if not path:
+        return {}
+    file_path = Path(path)
+    if not file_path.is_file():
+        return {}
+    payload = json.loads(file_path.read_text(encoding="utf-8"))
+    frames = payload.get("frames", payload if isinstance(payload, list) else [])
+    mapped: dict = {}
+    if isinstance(frames, list):
+        for item in frames:
+            if not isinstance(item, dict):
+                continue
+            state = item.get("state", item)
+            if "frame_index" in item:
+                mapped[int(item["frame_index"])] = state
+            if "timestamp_ms" in item:
+                mapped[int(item["timestamp_ms"])] = state
+    return mapped
+
+
+class ValidationSession:
+    """Short-lived browser session used by application validation."""
+
+    def __init__(self, browser: PlaywrightBrowserAdapter) -> None:
+        self.browser = browser
+
+    async def _first_present(self, selectors: list[str]):
+        for selector in selectors:
+            try:
+                found = await self.browser.query(selector)
+            except Exception:
+                continue
+            if found is not None:
+                return selector
+        return None
+
+
+# Mixin-style helper used by PlaywrightTryOnAdapter.
+async def _first_present_on(browser, selectors: list[str]):
+    for selector in selectors:
+        try:
+            found = await browser.query(selector)
+        except Exception:
+            continue
+        if found is not None:
+            return selector
+    return None
+
+
+PlaywrightTryOnAdapter._first_present = lambda self, selectors: _first_present_on(self.browser, selectors)

@@ -1,0 +1,35 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /app/data
+      DATABASE_URL: sqlite:////app/data/qa.sqlite3
+      FACE_MODEL_PATH: /app/models/face_landmarker.task
+      BACKEND_URL: http://localhost:8000
+      FRONTEND_URL: http://localhost:3000
+      CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      APPLITOOLS_ENABLED: ${APPLITOOLS_ENABLED:-false}
+      APPLITOOLS_API_KEY: ${APPLITOOLS_API_KEY:-}
+      APPLITOOLS_SERVER_URL: ${APPLITOOLS_SERVER_URL:-}
+      DEFAULT_CAPTURE_FPS: ${DEFAULT_CAPTURE_FPS:-5}
+      DEFAULT_MIN_CONFIDENCE: ${DEFAULT_MIN_CONFIDENCE:-0.80}
+      DEFAULT_PASS_THRESHOLD: ${DEFAULT_PASS_THRESHOLD:-0.10}
+      DEFAULT_FAIL_THRESHOLD: ${DEFAULT_FAIL_THRESHOLD:-0.15}
+      DEFAULT_MIN_PASS_RATE: ${DEFAULT_MIN_PASS_RATE:-0.95}
+      DEFAULT_MAX_CONSECUTIVE_FAILURES: ${DEFAULT_MAX_CONSECUTIVE_FAILURES:-2}
+      PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-true}
+    volumes:
+      - ./data:/app/data
+    shm_size: "1gb"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
