@@ -7,16 +7,18 @@ import { StatusBadge } from "./StatusBadge";
 
 export function ApplicationConfig({
   selectedId,
+  listVersion = 0,
   onSelect,
   onReady,
 }: {
   selectedId?: string;
+  listVersion?: number;
   onSelect?: (application: ApplicationRecord) => void;
   onReady?: (application: ApplicationRecord, jewelry: string[], username: string, password: string) => void;
 }) {
   const [items, setItems] = useState<ApplicationRecord[]>([]);
-  const [name, setName] = useState("AIJewel Amplify");
-  const [url, setUrl] = useState("https://demo-main.d1ug6v4fe77d43.amplifyapp.com/try-on");
+  const [name, setName] = useState("");
+  const [url, setUrl] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [faceFile, setFaceFile] = useState<File | null>(null);
@@ -26,12 +28,29 @@ export function ApplicationConfig({
   const [busy, setBusy] = useState(false);
 
   async function refresh() {
-    setItems(await api.applications());
+    const next = await api.applications();
+    setItems(next);
+    return next;
   }
 
   useEffect(() => {
-    refresh().catch((exc: Error) => setError(exc.message));
+    api
+      .tryonForm()
+      .then((form) => {
+        setName(form.name || "");
+        setUrl(form.url || "");
+        setUsername(form.username || "");
+      })
+      .catch(() => {
+        setName("");
+        setUrl("");
+        setUsername("");
+      });
   }, []);
+
+  useEffect(() => {
+    refresh().catch((exc: Error) => setError(exc.message));
+  }, [listVersion]);
 
   function choose(item: ApplicationRecord) {
     setName(item.name);
@@ -43,8 +62,10 @@ export function ApplicationConfig({
   }
 
   async function onValidate() {
-    if (!url.trim() || !username.trim() || !password) {
-      setError("Enter the try-on link, username, and password.");
+    const trimmedName = name.trim();
+    const trimmedUrl = url.trim();
+    if (!trimmedName || !trimmedUrl || !username.trim() || !password) {
+      setError("Enter the name, try-on link, username, and password.");
       return;
     }
     if (!faceFile && !savedVideo) {
@@ -55,14 +76,15 @@ export function ApplicationConfig({
     setError("");
     setValidation(null);
     try {
-      let record: ApplicationRecord;
-      if (selectedId) {
-        record = await api.updateApplication(selectedId, { url: url.trim(), username: username.trim() });
-      } else {
+      let record = selectedId ? items.find((item) => item.id === selectedId) : undefined;
+      if (!record) {
+        record = items.find((item) => item.name === trimmedName && item.url === trimmedUrl);
+      }
+      if (!record) {
         record = await api.createApplication({
-          name: name.trim() || "AIJewel Amplify",
+          name: trimmedName,
           type: "web",
-          url: url.trim(),
+          url: trimmedUrl,
           username: username.trim(),
         });
       }
@@ -70,10 +92,12 @@ export function ApplicationConfig({
         record = await api.uploadFaceVideo(record.id, faceFile);
         setSavedVideo(true);
       }
-      onSelect?.(record);
+      const checked = { ...record, name: trimmedName, url: trimmedUrl };
+      onSelect?.(checked);
       await refresh();
       const result = await api.validateApplication({
-        url: url.trim(),
+        url: trimmedUrl,
+        name: trimmedName,
         username: username.trim(),
         password,
         type: "web",
@@ -81,7 +105,14 @@ export function ApplicationConfig({
       });
       setValidation(result);
       if (result.status === "success") {
-        onReady?.(record, result.jewelry || [], username.trim(), password);
+        const savedItems = await refresh();
+        const saved = savedItems.find((item) => item.id === (result.application_id || record.id)) || {
+          ...checked,
+          name: trimmedName,
+          url: trimmedUrl,
+        };
+        onSelect?.(saved);
+        onReady?.(saved, result.jewelry || [], username.trim(), password);
       }
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "Validation failed");
@@ -95,7 +126,13 @@ export function ApplicationConfig({
       <Card title="Try-on application">
         <div className="space-y-3">
           <Field label="Name">
-            <input className={inputClass} value={name} onChange={(event) => setName(event.target.value)} required />
+            <input
+              className={inputClass}
+              placeholder="Application name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              required
+            />
           </Field>
           <Field label="Try-on link">
             <input
@@ -165,7 +202,7 @@ export function ApplicationConfig({
       </Card>
       <Card title="Saved applications">
         <ul className="space-y-2">
-          {items.map((item) => (
+          {items.filter((item) => item.url).map((item) => (
             <li key={item.id}>
               <button
                 type="button"
@@ -175,6 +212,7 @@ export function ApplicationConfig({
                 }`}
               >
                 <span className="block text-zinc-100">{item.name}</span>
+                <span className="mt-1 block truncate text-xs text-zinc-400">{item.url}</span>
                 <span className="text-xs text-zinc-500">
                   {item.id}
                   {item.video_path ? " · face video saved" : ""}
@@ -182,7 +220,7 @@ export function ApplicationConfig({
               </button>
             </li>
           ))}
-          {!items.length ? <li className="text-sm text-zinc-500">No applications saved.</li> : null}
+          {!items.some((item) => item.url) ? <li className="text-sm text-zinc-500">No applications saved.</li> : null}
         </ul>
       </Card>
     </div>

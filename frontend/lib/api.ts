@@ -90,6 +90,7 @@ export interface RunStatus {
   error: string | null;
   reason: string | null;
   recommended_action: string | null;
+  preview_image_url?: string | null;
 }
 
 export interface FrameRow {
@@ -176,14 +177,33 @@ export interface DashboardData {
   average_pass_rate: number | null;
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, {
+const LOOPBACK_API = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(API_URL);
+
+function apiRequest(path: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${API_URL}${path}`, {
     ...init,
+    // Chrome blocks an HTTPS page from calling http://localhost unless the
+    // request declares that the target is this computer.
+    ...(LOOPBACK_API ? { targetAddressSpace: "loopback" } : {}),
     headers: {
       ...(init?.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
       ...(init?.headers || {}),
     },
-  });
+  } as RequestInit);
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  let response: Response;
+  try {
+    response = await apiRequest(path, init);
+  } catch (exc) {
+    if (!(exc instanceof TypeError)) throw exc;
+    try {
+      response = await apiRequest(path, init);
+    } catch {
+      throw new Error(`The QA API at ${API_URL} did not respond. Start it, then reload this page.`);
+    }
+  }
   if (!response.ok) {
     let message = response.statusText;
     try {
@@ -208,6 +228,7 @@ export const api = {
   dashboard: () => request<DashboardData>("/api/v1/dashboard"),
   settings: () => request<Record<string, unknown>>("/api/v1/settings"),
   applications: () => request<ApplicationRecord[]>("/api/v1/applications"),
+  tryonForm: () => request<{ name: string; url: string; username: string }>("/api/v1/applications/form"),
   createApplication: (body: Record<string, unknown>) =>
     request<ApplicationRecord>("/api/v1/applications", { method: "POST", body: JSON.stringify(body) }),
   updateApplication: (id: string, body: { url?: string; username?: string }) =>

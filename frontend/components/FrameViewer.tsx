@@ -20,10 +20,10 @@ interface Props {
 }
 
 export function FrameViewer({ frame, passThreshold, failThreshold, zoneYScale = 1, reference }: Props) {
-  const [showLandmarks, setShowLandmarks] = useState(true);
-  const [showEarring, setShowEarring] = useState(true);
-  const [showZone, setShowZone] = useState(true);
-  const [showMeasurement, setShowMeasurement] = useState(true);
+  const [showLandmarks, setShowLandmarks] = useState(false);
+  const [showEarring, setShowEarring] = useState(false);
+  const [showZone, setShowZone] = useState(false);
+  const [showMeasurement, setShowMeasurement] = useState(false);
   const [annotated, setAnnotated] = useState(false);
 
   if (!frame) {
@@ -109,10 +109,10 @@ export function FrameViewer({ frame, passThreshold, failThreshold, zoneYScale = 
                   passThreshold={passThreshold}
                   failThreshold={failThreshold}
                   normalizedDistance={frame.normalized_distance}
-                  showLandmarks
-                  showEarring
-                  showZone
-                  showMeasurement
+                  showLandmarks={showLandmarks}
+                  showEarring={showEarring}
+                  showZone={showZone}
+                  showMeasurement={showMeasurement}
                 />
               </div>
               <p className="mt-2 text-sm text-zinc-300">Actual distance: {frame.normalized_distance?.toFixed(3) ?? "n/a"}</p>

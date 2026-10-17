@@ -17,6 +17,7 @@ export function Workflow() {
   const [test, setTest] = useState<TestRecord | null>(null);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [savedListVersion, setSavedListVersion] = useState(0);
   const [jewelry, setJewelry] = useState<string[]>([]);
   const [chosen, setChosen] = useState("");
   const [earSide, setEarSide] = useState<"left" | "right" | "both">("left");
@@ -25,6 +26,7 @@ export function Workflow() {
   const [active, setActive] = useState<FrameRow | null>(null);
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
+  const [previewTick, setPreviewTick] = useState(0);
   const [frameFilter, setFrameFilter] = useState<"all" | "FAIL" | "WARNING" | "PASS">("all");
   const [reviewReason, setReviewReason] = useState("False positive due to earring occlusion");
 
@@ -38,9 +40,11 @@ export function Workflow() {
       try {
         const next = await api.status(test.id);
         setStatus(next);
+        setPreviewTick(Date.now());
         if (next.status === "completed" || next.status === "failed") {
           window.clearInterval(timer);
           setRunning(false);
+          setSavedListVersion((version) => version + 1);
           setPassword("");
           if (next.status === "completed") {
             const result = await api.results(test.id);
@@ -162,6 +166,7 @@ export function Workflow() {
         <StepHeading step="1" title="Try-On Application" />
         <ApplicationConfig
           selectedId={application?.id}
+          listVersion={savedListVersion}
           onSelect={(item) => {
             setApplication(item);
             setUsername(item.username || username);
@@ -210,6 +215,16 @@ export function Workflow() {
             {running ? "Testing placement…" : "Test this earring"}
           </button>
         {error ? <p className="mt-3 text-sm text-red-400">{error}</p> : null}
+        {running && status?.preview_image_url ? (
+          <div className="mt-6">
+            <p className="mb-2 text-sm text-zinc-300">Selected jewelry on the live video. Pass or fail comes after this.</p>
+            <img
+              src={`${api.asset(status.preview_image_url)}?t=${previewTick}`}
+              alt="Live jewelry overlay"
+              className="max-h-[420px] w-full rounded border border-zinc-800 object-contain"
+            />
+          </div>
+        ) : null}
         <div className="mt-6">
           <TestProgress status={status} />
         </div>
